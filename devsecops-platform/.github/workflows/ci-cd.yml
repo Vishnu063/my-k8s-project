@@ -1,0 +1,158 @@
+name: DevSecOps CI/CD
+
+# Runs on every push to main. In a real team you'd gate this on pull_request
+# too (SonarQube/Trivy as required checks before merge) — omitted here to
+# keep the demo pipeline simple to trigger.
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+
+jobs:
+  # =========================================================================
+  # STAGE 1 — Unit tests. Nothing else should run if the app itself is broken.
+  # =========================================================================
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r app/requirements.txt
+          pip install pytest
+
+      - name: Run unit tests
+        run: pytest tests/ -v
+
+  # =========================================================================
+  # STAGE 2 — Static code analysis (SAST) via SonarCloud. This is the
+  # "shift-left" part: catching bugs, code smells, and vulnerable patterns
+  # in the source itself, before it's ever built into an image.
+  # SonarCloud is free for public repos — sign up at sonarcloud.io and
+  # link this repo, then add SONAR_TOKEN as a GitHub secret.
+  # =========================================================================
+  code-quality-scan:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # SonarCloud needs full git history for blame/new-code analysis
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # =========================================================================
+  # STAGE 3 — Dependency vulnerability scan (SCA). Checks requirements.txt
+  # against the OWASP database for known-vulnerable package versions.
+  # =========================================================================
+  dependency-scan:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: "devsecops-platform"
+          path: "app/"
+          format: "HTML"
+          args: >
+            --failOnCVSS 9
+            --enableRetired
+
+      - name: Upload dependency-check report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: reports/
+
+  # =========================================================================
+  # STAGE 4 — Build the image, scan it with Trivy BEFORE it's pushed
+  # anywhere, then push to ECR only if the scan passes.
+  # =========================================================================
+  build-scan-push:
+    needs: [code-quality-scan, dependency-scan]
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag from commit SHA
+        id: vars
+        run: echo "image_tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg APP_VERSION=${{ steps.vars.outputs.image_tag }} \
+            -t ${{ env.ECR_REPOSITORY }}:${{ steps.vars.outputs.image_tag }} \
+            app/
+
+      # Trivy is the last gate before anything reaches the registry.
+      # exit-code 1 makes the pipeline FAIL (not just report) on
+      # CRITICAL/HIGH findings — this is what makes the scan meaningful
+      # rather than decorative.
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.ECR_REPOSITORY }}:${{ steps.vars.outputs.image_tag }}"
+          format: "table"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+
+      - name: Push image to ECR
+        run: |
+          docker push ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.vars.outputs.image_tag }}
+
+  # =========================================================================
+  # STAGE 5 — GitOps handoff. We do NOT run kubectl apply here. Instead we
+  # update the image tag in k8s/deployment.yaml and commit it back to the
+  # repo. ArgoCD (running inside the cluster) is watching this repo and
+  # will detect the change and deploy it automatically. This is the actual
+  # definition of GitOps: the pipeline's job ends at "update desired state
+  # in Git" — the cluster reconciles itself.
+  # =========================================================================
+  update-manifest:
+    needs: build-scan-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update image tag in deployment manifest
+        run: |
+          sed -i "s|image: .*devsecops-platform-app.*|image: ${{ secrets.ECR_REPOSITORY }}:${{ needs.build-scan-push.outputs.image_tag }}|" k8s/deployment.yaml
+
+      - name: Commit and push updated manifest
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add k8s/deployment.yaml
+          git commit -m "ci: deploy image ${{ needs.build-scan-push.outputs.image_tag }}" || echo "No changes to commit"
+          git push
