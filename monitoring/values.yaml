@@ -1,0 +1,7 @@
+USER-SUPPLIED VALUES:
+kubeControllerManager:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeScheduler:
+  enabled: false
